@@ -142,6 +142,17 @@ function hostForOverlaySync(): any {
 let _checkerQueryDepth = 0;
 /** Host text last pushed to tsgo per file — skip redundant updateSnapshot. */
 const _syncedOverlayContentByFile = new Map<string, string>();
+// Files whose host snapshot text was verified to match disk (no overlay
+// needed), keyed on the exact text instance/content. Skips the per-sync
+// disk read+compare in shouldSendHostOverlay for unchanged files.
+const _overlayCleanTextByFile = new Map<string, string>();
+// collectTsgoOpenFileNames enumerates the full LS host file list and, for
+// rbxtsc's transformer-watcher host, getScriptFileNames() stats every file.
+// The open-file set only changes when a client opens a new file, so the
+// resolved list is cached per host and recomputed only when a requested
+// file falls outside it (or a content push rotates the snapshot).
+let _collectedOpenFilesCache: { host: unknown; names: string[]; set: Set<string> } | undefined;
+const _globalDiagnosticsCache = new WeakMap<object, readonly any[]>();
 // Files already registered as open in the current tsgo snapshot. Snapshot
 // rotation invalidates object registries (Symbol/Type identity!), so
 // pushHostOverlayToTsgo must NOT bump the snapshot unless there is genuinely
@@ -1608,7 +1619,19 @@ export function createTsgoProgram(
                 : project?.program?.getSyntacticDiagnostics?.();
             return mapTsgoDiagnostics(raw, getDiagnosticSourceFile);
         },
-        getGlobalDiagnostics: () => mapTsgoDiagnostics(project?.program?.getGlobalDiagnostics?.(), getDiagnosticSourceFile),
+        // Global diagnostics are program-wide and immutable per snapshot, but
+        // ts.getPreEmitDiagnostics re-requests them for every file — cache per
+        // tsgo project instance (rotations swap the instance).
+        getGlobalDiagnostics: () => {
+            const prog = project?.program;
+            if (!prog) return [];
+            let cached = _globalDiagnosticsCache.get(prog);
+            if (!cached) {
+                cached = mapTsgoDiagnostics(prog.getGlobalDiagnostics?.(), getDiagnosticSourceFile);
+                _globalDiagnosticsCache.set(prog, cached);
+            }
+            return cached;
+        },
         getSuggestionDiagnostics: (sourceFile?: any) => {
             const raw = sourceFile?.fileName
                 ? project?.program?.getSuggestionDiagnostics?.(tsgoFileArg(sourceFile.fileName))
@@ -2283,16 +2306,34 @@ export function createTsgoChecker(program: any): any {
         const syncHost = hostForOverlaySync();
         if (!syncHost) return;
 
-        const openFiles = collectTsgoOpenFileNames(syncHost, requestedFileName ? [requestedFileName] : undefined);
+        let openFiles: string[];
+        const collectCached = _collectedOpenFilesCache;
+        if (
+            collectCached
+            && collectCached.host === syncHost
+            && (!requestedFileName || collectCached.set.has(resolveHostFileName(requestedFileName, syncHost)))
+        ) {
+            openFiles = collectCached.names;
+        } else {
+            openFiles = collectTsgoOpenFileNames(syncHost, requestedFileName ? [requestedFileName] : undefined);
+            _collectedOpenFilesCache = { host: syncHost, names: openFiles, set: new Set(openFiles) };
+        }
         const openFilesWithContent: { fileName: string; content: string; scriptKind: number }[] = [];
         for (const hostFileName of openFiles) {
             if (!isOverlayCandidatePath(hostFileName)) continue;
             const content = getHostScriptContent(syncHost, hostFileName, ctx.options);
             if (!content?.text) continue;
+            // Cheap in-memory guards first: an unchanged snapshot (already
+            // synced as an overlay, or verified clean against disk) must not
+            // pay the shouldSendHostOverlay stat+read on every sync.
+            if (_syncedOverlayContentByFile.get(hostFileName) === content.text) continue;
+            if (_overlayCleanTextByFile.get(hostFileName) === content.text) continue;
             const hostOnly = !fileExistsOnDisk(hostFileName);
             const inTsgo = !!project?.program?.getSourceFile?.(toTsgoFileName(hostFileName));
-            if (!hostOnly && inTsgo && !shouldSendHostOverlay(hostFileName, content.text)) continue;
-            if (!hostOnly && _syncedOverlayContentByFile.get(hostFileName) === content.text) continue;
+            if (!hostOnly && inTsgo && !shouldSendHostOverlay(hostFileName, content.text)) {
+                _overlayCleanTextByFile.set(hostFileName, content.text);
+                continue;
+            }
             openFilesWithContent.push({ fileName: hostFileName, content: content.text, scriptKind: content.scriptKind });
         }
         if (!openFiles.length && !openFilesWithContent.length) return;
@@ -2318,6 +2359,7 @@ export function createTsgoChecker(program: any): any {
         for (const f of openFilesWithContent) {
             _tsgoOpenedFiles.add(f.fileName);
             _syncedOverlayContentByFile.set(f.fileName, f.content);
+            _overlayCleanTextByFile.delete(f.fileName);
             tsgoSfCache.delete(f.fileName);
             nodeIndexCache.delete(f.fileName);
             nodeAtPosCache.delete(f.fileName);
@@ -2329,6 +2371,7 @@ export function createTsgoChecker(program: any): any {
         if (process.env.TNB_DEBUG === "1") {
             console.error(`[TNB] snapshot rotated with ${openFilesWithContent.length} content change(s) — symbols held across this point lose identity`);
         }
+        _collectedOpenFilesCache = undefined;
         _referencedAliasSpansByFile.clear();
         symByPos.clear();
         wideSymCache.clear();
