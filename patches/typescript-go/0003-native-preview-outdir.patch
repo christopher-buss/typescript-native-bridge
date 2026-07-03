@@ -1,8 +1,14 @@
-diff --git a/_packages/native-preview/tsconfig.json b/_packages/native-preview/tsconfig.json
+diff --git i/_packages/native-preview/tsconfig.json w/_packages/native-preview/tsconfig.json
 index ea7eee906..5a98bbf72 100644
---- a/_packages/native-preview/tsconfig.json
-+++ b/_packages/native-preview/tsconfig.json
-@@ -7,7 +7,7 @@
+--- i/_packages/native-preview/tsconfig.json
++++ w/_packages/native-preview/tsconfig.json
+@@ -1,13 +1,13 @@
+ {
+     "extends": "./tsconfig.base.json",
+     "compilerOptions": {
+         "module": "node16",
+         "isolatedDeclarations": true,
+         "sourceMap": true,
          "declaration": true,
          "declarationMap": true,
          "rootDir": "src",

@@ -52,7 +52,11 @@ export function resolveHostFileName(fileName: string, host?: { getCurrentDirecto
 }
 
 export function toTsgoFileName(fileName: string): string {
-    return hostPathToBundledLibPath(fileName) ?? fileName;
+    const mapped = hostPathToBundledLibPath(fileName);
+    if (mapped) return mapped;
+    // tsgo expects forward-slash paths; Windows host SourceFiles carry
+    // backslash fileNames, which the Go URI parser treats as relative.
+    return typeof fileName === "string" ? fileName.replace(/\\/g, "/") : fileName;
 }
 
 export function isHostLibFile(fileName: string): boolean {
