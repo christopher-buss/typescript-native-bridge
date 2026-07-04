@@ -3244,10 +3244,67 @@ index edc209b39..21928e66e 100644
  }
  
 diff --git i/internal/project/overlayfs.go w/internal/project/overlayfs.go
-index 1b300a013..de14d03a0 100644
+index 1b300a013..e029c44f2 100644
 --- i/internal/project/overlayfs.go
 +++ w/internal/project/overlayfs.go
-@@ -293,29 +293,34 @@ func (fs *overlayFS) processChanges(changes []FileChange) (FileChangeSummary, ma
+@@ -1,13 +1,14 @@
+ package project
+ 
+ import (
++	"fmt"
+ 	"maps"
+ 	"strings"
+ 	"sync"
+ 
+ 	"github.com/microsoft/typescript-go/internal/core"
+ 	"github.com/microsoft/typescript-go/internal/ls/lsconv"
+ 	"github.com/microsoft/typescript-go/internal/lsp/lsproto"
+ 	"github.com/microsoft/typescript-go/internal/sourcemap"
+ 	"github.com/microsoft/typescript-go/internal/tspath"
+ 	"github.com/microsoft/typescript-go/internal/vfs"
+@@ -226,21 +227,40 @@ func (fs *overlayFS) processChanges(changes []FileChange) (FileChangeSummary, ma
+ 		deleted      bool
+ 	}
+ 
+ 	fileEventMap := make(map[lsproto.DocumentUri]*fileEvents)
+ 
+ 	for _, change := range changes {
+ 		uri := change.URI
+ 		events, exists := fileEventMap[uri]
+ 		if exists {
+ 			if events.openChange != nil {
+-				panic("should see no changes after open")
++				// API-driven sessions (bridge updateSnapshot) can batch a
++				// watch event or a duplicate open (same file under two path
++				// spellings → one canonical URI) with the original open. The
++				// open's overlay content supersedes disk, so watch-kind noise
++				// is safe to drop, and a re-open replaces the first (same
++				// reset as the main Open case). Anything else still indicates
++				// a protocol-ordering bug.
++				if change.Kind.IsWatchKind() {
++					continue
++				}
++				if change.Kind == FileChangeKindOpen {
++					events.openChange = &change
++					events.watchChanged = false
++					events.changes = nil
++					events.saved = false
++					events.created = false
++					events.deleted = false
++					continue
++				}
++				panic(fmt.Sprintf("should see no changes after open (uri=%s kind=%v openKind=%v)", uri, change.Kind, events.openChange.Kind))
+ 			}
+ 		} else {
+ 			events = &fileEvents{}
+ 			fileEventMap[uri] = events
+ 		}
+ 
+ 		if !result.IncludesWatchChangeOutsideNodeModules && change.Kind.IsWatchKind() && !strings.Contains(string(uri), "/node_modules/") {
+ 			result.IncludesWatchChangeOutsideNodeModules = true
+ 		}
+ 
+@@ -293,29 +313,34 @@ func (fs *overlayFS) processChanges(changes []FileChange) (FileChangeSummary, ma
  			}
  		}
  	}

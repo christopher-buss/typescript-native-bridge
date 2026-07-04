@@ -153,6 +153,7 @@ const _overlayCleanTextByFile = new Map<string, string>();
 // file falls outside it (or a content push rotates the snapshot).
 let _collectedOpenFilesCache: { host: unknown; names: string[]; set: Set<string> } | undefined;
 const _globalDiagnosticsCache = new WeakMap<object, readonly any[]>();
+let _fileIncludeReasonsCacheSize = -1;
 // Files already registered as open in the current tsgo snapshot. Snapshot
 // rotation invalidates object registries (Symbol/Type identity!), so
 // pushHostOverlayToTsgo must NOT bump the snapshot unless there is genuinely
@@ -310,16 +311,68 @@ function sourceFileFromHostSnapshot(host: any, hostFileName: string, requestFile
     return attachHostSourceFileMetadata(sf, hostFileName);
 }
 
+/**
+ * Content-derived SourceFile version. BuilderProgram fileInfos persist this
+ * into the tsbuildinfo; a constant ("1") makes every incremental reload see
+ * every file as changed. djb2 matches the builder's own no-createHash
+ * fallback and is stable across processes.
+ */
+function computeSourceVersion(text: string | undefined): string {
+    return (ts as any).generateDjb2Hash(text ?? "");
+}
+/**
+ * Populate `imports`/`moduleAugmentations` the way createProgram's
+ * collectExternalModuleReferences does (top-level statements only). The
+ * parser leaves both empty; BuilderState.getReferencedFiles reads them to
+ * build the referencedMap that incremental builds persist — without it,
+ * every tsbuildinfo reload treats the whole program as changed.
+ */
+function collectModuleReferencesForBuilder(sf: any): void {
+    if (!sf || sf.__tnbImportsCollected) return;
+    sf.__tnbImportsCollected = true;
+    const imports: any[] = [];
+    const moduleAugmentations: any[] = [];
+    for (const node of sf.statements ?? []) {
+        if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node))
+            && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+            imports.push(node.moduleSpecifier);
+        } else if (ts.isImportEqualsDeclaration(node)
+            && ts.isExternalModuleReference(node.moduleReference)
+            && node.moduleReference.expression && ts.isStringLiteral(node.moduleReference.expression)) {
+            imports.push(node.moduleReference.expression);
+        } else if (ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name)) {
+            moduleAugmentations.push(node.name);
+        }
+    }
+    sf.imports = imports;
+    sf.moduleAugmentations = moduleAugmentations;
+}
+/** Canonical Path (stock toPath semantics) — buildinfo round-trips key on this. */
+let _canonicalPathFn: ((fileName: string) => string) | undefined;
+function toCanonicalPath(fileName: string): Path {
+    if (!_canonicalPathFn) {
+        const canonical = ts.createGetCanonicalFileName(ts.sys?.useCaseSensitiveFileNames ?? false);
+        const cwd = ts.sys?.getCurrentDirectory?.() ?? process.cwd();
+        _canonicalPathFn = fn => (ts as any).toPath(fn, cwd, canonical);
+    }
+    return _canonicalPathFn(fileName) as Path;
+}
 /** Ensure host SourceFiles expose stable path metadata for LS + module path completion. */
 function attachHostSourceFileMetadata(sf: any, hostFileName: string): any {
     sf.fileName = hostFileName;
     sf.originalFileName = hostFileName;
+    // `path` stays the raw host name — TNB internals (node lookup, guard
+    // caches) key on it. `resolvedPath` must be CANONICAL (stock ts.Path):
+    // BuilderState keys fileInfos/referencedMap on resolvedPath and the
+    // tsbuildinfo reload re-canonicalizes its keys — a raw mixed-case path
+    // never matches the old state, so incremental builds recompile the world.
     sf.path = hostFileName as Path;
     sf.resolvedPath = hostFileName as Path;
+    collectModuleReferencesForBuilder(sf);
     if (!sf.imports) sf.imports = [];
     if (!sf.moduleAugmentations) sf.moduleAugmentations = [];
     if (!("version" in sf)) {
-        try { Object.defineProperty(sf, "version", { value: "1", writable: true, configurable: true, enumerable: false }); } catch {}
+        try { Object.defineProperty(sf, "version", { value: computeSourceVersion(sf.text), writable: true, configurable: true, enumerable: false }); } catch {}
     }
     return sf;
 }
@@ -1383,11 +1436,11 @@ export function createTsgoProgram(
         const scriptKind = hostContent?.scriptKind ?? inferScriptKind(hostFileName);
         const sf = createSkeletonSourceFile(hostFileName, text, options.target ?? 99, scriptKind);
         const anySf = sf as any;
-        anySf.version = "1";
+        anySf.version = computeSourceVersion(text);
         const backed = getTsgoBackedSourceFile(anySf);
         const result = backed ?? anySf;
         if (result && !("version" in result)) {
-            try { Object.defineProperty(result, "version", { value: "1", writable: true, configurable: true, enumerable: false }); } catch {}
+            try { Object.defineProperty(result, "version", { value: computeSourceVersion(text), writable: true, configurable: true, enumerable: false }); } catch {}
         }
         if (result && result !== anySf) {
             try {
@@ -1431,15 +1484,20 @@ export function createTsgoProgram(
         // fileInfos and to ask for referenced/imported files (empty here).
         // tsserver getScriptInfos() requires ScriptInfo for every returned file;
         // default libs are not opened as ScriptInfo — exclude them here.
-        const tsgoPath = hostFileName;
+        const tsgoPath = toCanonicalPath(hostFileName);
+        // Version must reflect on-disk content even though the light stub
+        // skips materializing the text — the builder persists it as the
+        // file's incremental identity. One readFile per file per program is
+        // the price of a working tsbuildinfo.
+        const versionText = hostContentByFile.get(hostFileName)?.text ?? host?.readFile?.(hostFileName);
         const sf: any = {
             kind: SyntaxKind.SourceFile,
             fileName: hostFileName,
-            path: tsgoPath,
-            resolvedPath: tsgoPath,
+            path: hostFileName,
+            resolvedPath: hostFileName,
             originalFileName: hostFileName,
             text: "",
-            version: "1",
+            version: computeSourceVersion(versionText),
             languageVersion: options.target ?? 99,
             languageVariant: 0,
             scriptKind: inferScriptKind(hostFileName),
@@ -1480,6 +1538,16 @@ export function createTsgoProgram(
             configurable: true,
             get() { return upgrade()?.endOfFileToken ?? { kind: SyntaxKind.EndOfFileToken, pos: 0, end: 0 }; },
         });
+        // BuilderState.getReferencedFiles reads dependency metadata off every
+        // program file to build the referencedMap persisted in tsbuildinfo.
+        // Empty stubs would serialize an empty map -> canReuseOldState fails
+        // on reload -> every incremental build recompiles the world.
+        for (const metadataField of ["imports", "moduleAugmentations", "referencedFiles", "typeReferenceDirectives"] as const) {
+            Object.defineProperty(sf, metadataField, {
+                configurable: true,
+                get() { return upgrade()?.[metadataField] ?? []; },
+            });
+        }
         lightSfCache.set(hostFileName, sf);
         return sf;
     };
@@ -1566,6 +1634,7 @@ export function createTsgoProgram(
     };
 
     let _commonSourceDirectory: string | undefined;
+    let _fileIncludeReasonsCache: Map<any, any[]> | undefined;
     const thinProgram: any = {
         // Marks this as a tsgo-backed program: its SourceFiles come straight from
         // tsgo and are never acquired via the LanguageService document registry.
@@ -1573,7 +1642,12 @@ export function createTsgoProgram(
         // mandatory) releaseDocumentWithKey pass, which would fault on the missing
         // registry bucket and abort ConfiguredProject.close mid-teardown.
         isTsgoBackedProgram: true,
-        getRootFileNames: () => collectTsgoOpenFileNames(_languageServiceHost ?? host, rootNames as string[]),
+        // Forward-slash shape: stock returns config fileNames verbatim, and
+        // buildinfo serialization (resolvedRoot/toFileId) must key these the
+        // same way as fileInfos paths — backslashed names mint duplicate ids.
+        getRootFileNames: () =>
+            collectTsgoOpenFileNames(_languageServiceHost ?? host, rootNames as string[])
+                .map(fn => fn.replace(/\\/g, "/")),
         getCompilerOptions: () => options,
         getSourceFileNames,
         getSourceFile: (fileName: string) => getOrCreateSourceFile(fileName),
@@ -1717,7 +1791,24 @@ export function createTsgoProgram(
                 sourceMaps: [],
             };
         },
-        emitBuildInfo: () => ({ emitSkipped: true, diagnostics: [] }),
+        // Real buildinfo emit: createBuilderProgram installs its state
+        // serializer as `program.getBuildInfo` (overwriting the stub below),
+        // so serializing it here restores `tsc -b` incremental up-to-date
+        // checks. A skipped result would leave no .tsbuildinfo on disk and
+        // force every solution build to start cold.
+        emitBuildInfo(this: any, writeFileCallback?: any): any {
+            const buildInfoPath = (ts as any).getTsBuildInfoEmitOutputFilePath(options);
+            if (!buildInfoPath) return { emitSkipped: true, diagnostics: [] };
+            const buildInfo = this?.getBuildInfo?.();
+            if (!buildInfo) return { emitSkipped: true, diagnostics: [] };
+            const text = (ts as any).getBuildInfoText(buildInfo);
+            const write = typeof writeFileCallback === "function"
+                ? writeFileCallback
+                : host?.writeFile?.bind(host);
+            if (!write) return { emitSkipped: true, diagnostics: [] };
+            write(buildInfoPath, text, false, undefined, undefined, { buildInfo });
+            return { emitSkipped: false, diagnostics: [], emittedFiles: [buildInfoPath] };
+        },
         isSourceFileFromExternalLibrary: () => false,
         isSourceFileDefaultLibrary: (sf: any) => {
             const fn = sf?.fileName ?? "";
@@ -1725,7 +1816,46 @@ export function createTsgoProgram(
         },
         getBuildInfo: () => undefined,
         getSourceFileFromReference: () => undefined,
-        getFileIncludeReasons: () => new Map(),
+        // Buildinfo serialization (getBuildInfo -> tryAddRoot) reads a reason
+        // list for EVERY program file and checks `kind === RootFile`; an empty
+        // map crashes it. Synthesize one entry per source file: RootFile for
+        // configured roots, Import for the rest (only the kind matters here).
+        getFileIncludeReasons(this: any): Map<any, any[]> {
+            const sourceFiles = this?.getSourceFiles?.() ?? [];
+            if (_fileIncludeReasonsCache && _fileIncludeReasonsCacheSize === sourceFiles.length) {
+                return _fileIncludeReasonsCache;
+            }
+            const reasons = new Map<any, any[]>();
+            const canonical = ts.createGetCanonicalFileName(host?.useCaseSensitiveFileNames?.() ?? false);
+            const currentDirectory = host?.getCurrentDirectory?.() ?? process.cwd();
+            const toPathKey = (fn: string) => (ts as any).toPath(toHostFileName(fn), currentDirectory, canonical);
+            const rootSet = new Set<string>();
+            for (const fn of this?.getRootFileNames?.() ?? rootNames) {
+                if (typeof fn === "string") rootSet.add(toPathKey(fn));
+            }
+            let index = 0;
+            for (const sf of sourceFiles) {
+                const isRoot = rootSet.has(toPathKey(sf.fileName));
+                const entry = [isRoot ? { kind: 0 /* RootFile */, index: index++ } : { kind: 3 /* Import */ }];
+                // Key under every path shape lookups use: the SF's own .path
+                // (when set), and toPath of both the raw and host-mapped names.
+                for (const key of new Set([
+                    sf.path,
+                    (ts as any).toPath(sf.fileName, currentDirectory, canonical),
+                    (ts as any).toPath(toHostFileName(sf.fileName), currentDirectory, canonical),
+                ])) {
+                    if (key) reasons.set(key, entry);
+                }
+            }
+            // Unknown key shapes must not crash getBuildInfo — fall back to a
+            // non-root reason (only `kind === RootFile` is ever inspected).
+            const fallbackEntry = [{ kind: 3 /* Import */ }];
+            const originalGet = reasons.get.bind(reasons);
+            reasons.get = (key: any) => originalGet(key) ?? fallbackEntry;
+            _fileIncludeReasonsCache = reasons;
+            _fileIncludeReasonsCacheSize = sourceFiles.length;
+            return reasons;
+        },
         getModuleResolutionCache: () => undefined,
         getSymlinkCache: () => (_symlinkCache ??= buildSymlinkCache()),
         getModeForUsageLocation: (file: any, usage: any) => (ts as any).getModeForUsageLocation(file, usage, options),
