@@ -1,0 +1,681 @@
+diff --git i/scripts/produceLKG.mjs w/scripts/produceLKG.mjs
+index 4209a2b9b5..c28187eee3 100644
+--- i/scripts/produceLKG.mjs
++++ w/scripts/produceLKG.mjs
+@@ -3,21 +3,21 @@ import { glob } from "glob";
+ import path from "path";
+ import url from "url";
+ 
+ import { localizationDirectories } from "./build/localization.mjs";
+ 
+ const __filename = url.fileURLToPath(new URL(import.meta.url));
+ const __dirname = path.dirname(__filename);
+ 
+ const root = path.join(__dirname, "..");
+ const source = path.join(root, "built/local");
+-const dest = path.join(root, "lib");
++const dest = path.join(root, "..", "lib");
+ 
+ async function produceLKG() {
+     console.log(`Building LKG from ${source} to ${dest}`);
+     await fs.promises.rm(dest, { recursive: true, force: true });
+     await fs.promises.mkdir(dest, { recursive: true });
+     await copyLibFiles();
+     await copyLocalizedDiagnostics();
+     await copyTypesMap();
+     await copyScriptOutputs();
+     await copyDeclarationOutputs();
+diff --git i/src/compiler/_namespaces/ts.ts w/src/compiler/_namespaces/ts.ts
+index bd9684e481..74b178d66f 100644
+--- i/src/compiler/_namespaces/ts.ts
++++ w/src/compiler/_namespaces/ts.ts
+@@ -22,20 +22,22 @@ export * from "../factory/emitHelpers.js";
+ export * from "../factory/nodeTests.js";
+ export * from "../factory/nodeChildren.js";
+ export * from "../factory/utilities.js";
+ export * from "../factory/utilitiesPublic.js";
+ export * from "../parser.js";
+ export * from "../commandLineParser.js";
+ export * from "../moduleNameResolver.js";
+ export * from "../binder.js";
+ export * from "../symbolWalker.js";
+ export * from "../checker.js";
++export * from "../tsgoChecker.js";
++export * from "../tsgoBackedSourceFile.js";
+ export * from "../visitorPublic.js";
+ export * from "../sourcemap.js";
+ export * from "../transformers/utilities.js";
+ export * from "../transformers/destructuring.js";
+ export * from "../transformers/classThis.js";
+ export * from "../transformers/namedEvaluation.js";
+ export * from "../transformers/taggedTemplate.js";
+ export * from "../transformers/ts.js";
+ export * from "../transformers/classFields.js";
+ export * from "../transformers/typeSerializer.js";
+diff --git i/src/compiler/parser.ts w/src/compiler/parser.ts
+index 68133ac5f1..3effa07d2c 100644
+--- i/src/compiler/parser.ts
++++ w/src/compiler/parser.ts
+@@ -1243,20 +1243,26 @@ function forEachChildInPartiallyEmittedExpression<T>(node: PartiallyEmittedExpre
+  * @param cbNode a callback to be invoked for all child nodes
+  * @param cbNodes a callback to be invoked for embedded array
+  *
+  * @remarks `forEachChild` must visit the children of a node in the order
+  * that they appear in the source code. The language service depends on this property to locate nodes by position.
+  */
+ export function forEachChild<T>(node: Node, cbNode: (node: Node) => T | undefined, cbNodes?: (nodes: NodeArray<Node>) => T | undefined): T | undefined {
+     if (node === undefined || node.kind <= SyntaxKind.LastToken) {
+         return;
+     }
++    // tsgo RemoteNode/RemoteSourceFile have their own forEachChild that walks
++    // the binary blob. The fork's forEachChildTable is indexed by fork kind
++    // values which differ from tsgo's — delegate to the node's own method.
++    if (typeof (node as any).forEachChild === "function" && "_offsetNodes" in (node as any)) {
++        return (node as any).forEachChild(cbNode, cbNodes);
++    }
+     const fn = (forEachChildTable as Record<SyntaxKind, ForEachChildFunction<any>>)[node.kind];
+     return fn === undefined ? undefined : fn(node, cbNode, cbNodes);
+ }
+ 
+ /**
+  * Invokes a callback for each child of the given node. The 'cbNode' callback is invoked for all child nodes
+  * stored in properties. If a 'cbNodes' callback is specified, it is invoked for embedded arrays; additionally,
+  * unlike `forEachChild`, embedded arrays are flattened and the 'cbNode' callback is invoked for each element.
+  *  If a callback returns a truthy value, iteration stops and that value is returned. Otherwise, undefined is returned.
+  *
+diff --git i/src/compiler/program.ts w/src/compiler/program.ts
+index b44a155f01..c631f17df1 100644
+--- i/src/compiler/program.ts
++++ w/src/compiler/program.ts
+@@ -41,20 +41,21 @@ import {
+     createModeAwareCache,
+     createModeAwareCacheKey,
+     createModuleResolutionCache,
+     createMultiMap,
+     createProgramDiagnostics,
+     CreateProgramOptions,
+     createSourceFile,
+     CreateSourceFileOptions,
+     createSymlinkCache,
+     createTypeChecker,
++    createTsgoProgram,
+     createTypeReferenceDirectiveResolutionCache,
+     CustomTransformers,
+     Debug,
+     DeclarationWithTypeParameterChildren,
+     Diagnostic,
+     DiagnosticArguments,
+     DiagnosticCategory,
+     diagnosticCategoryName,
+     DiagnosticMessage,
+     DiagnosticMessageChain,
+@@ -400,21 +401,24 @@ export function createGetSourceFile(
+             text = readFile(fileName);
+             performance.mark("afterIORead");
+             performance.measure("I/O Read", "beforeIORead", "afterIORead");
+         }
+         catch (e) {
+             if (onError) {
+                 onError(e.message);
+             }
+             text = "";
+         }
+-        return text !== undefined ? createSourceFile(fileName, text, languageVersionOrOptions, setParentNodes) : undefined;
++        if (text !== undefined) {
++            return createSourceFile(fileName, text, languageVersionOrOptions, setParentNodes);
++        }
++        return undefined;
+     };
+ }
+ 
+ /** @internal */
+ export function createWriteFileMeasuringIO(
+     actualWriteFile: (path: string, data: string, writeByteOrderMark: boolean) => void,
+     createDirectory: (path: string) => void,
+     directoryExists: (path: string) => boolean,
+ ): CompilerHost["writeFile"] {
+     return (fileName, data, writeByteOrderMark, onError) => {
+@@ -1521,20 +1525,29 @@ export function createProgram(_rootNamesOrOptions: readonly string[] | CreatePro
+     _rootNamesOrOptions = undefined!;
+ 
+     for (const option of commandLineOptionOfCustomType) {
+         if (hasProperty(options, option.name)) {
+             if (typeof options[option.name] === "string") {
+                 throw new Error(`${option.name} is a string value; tsconfig JSON must be parsed with parseJsonSourceFileConfigFileContent or getParsedCommandLineOfConfigFile before passing to createProgram`);
+             }
+         }
+     }
+ 
++    // Thin tsgo-backed program: skip the entire TS file-resolution / module-
++    // resolution / source-file-creation pipeline. tsgo resolves files from
++    // the tsconfig and uses host-fed overlay content. Saves ~576ms of
++    // createProgram overhead on self-lint. The tsgo backend is the fork's whole
++    // purpose, so it is always taken when a tsconfig is available.
++    if (options.configFilePath) {
++        return createTsgoProgram(rootNames, options, createProgramOptionsHost, projectReferences, configFileParsingDiagnostics) as Program;
++    }
++
+     const reportInvalidIgnoreDeprecations = memoize(() => createOptionValueDiagnostic("ignoreDeprecations", Diagnostics.Invalid_value_for_ignoreDeprecations));
+ 
+     let processingDefaultLibFiles: SourceFile[] | undefined;
+     let processingOtherFiles: SourceFile[] | undefined;
+     let files: SourceFile[];
+     let symlinks: SymlinkCache | undefined;
+     let typeChecker: TypeChecker;
+     let classifiableNames: Set<__String>;
+     let filesWithReferencesProcessed: Set<Path> | undefined;
+     let cachedBindAndCheckDiagnosticsForFile: Map<Path, readonly Diagnostic[]> | undefined;
+@@ -2675,21 +2688,22 @@ export function createProgram(_rootNamesOrOptions: readonly string[] | CreatePro
+ 
+     function isSourceFileFromExternalLibrary(file: SourceFile): boolean {
+         return !!sourceFilesFoundSearchingNodeModules.get(file.path);
+     }
+ 
+     function isSourceFileDefaultLibrary(file: SourceFile): boolean {
+         return libFiles.has(file.path);
+     }
+ 
+     function getTypeChecker() {
+-        return typeChecker || (typeChecker = createTypeChecker(program));
++        if (typeChecker) return typeChecker;
++        return typeChecker = createTypeChecker(program);
+     }
+ 
+     function emit(
+         sourceFile?: SourceFile,
+         writeFileCallback?: WriteFileCallback,
+         cancellationToken?: CancellationToken,
+         emitOnly?: boolean | EmitOnly,
+         transformers?: CustomTransformers,
+         forceDtsEmit?: boolean,
+         skipBuildInfo?: boolean,
+diff --git i/src/server/editorServices.ts w/src/server/editorServices.ts
+index aa578c7ed0..b8fda38051 100644
+--- i/src/server/editorServices.ts
++++ w/src/server/editorServices.ts
+@@ -2184,21 +2184,61 @@ export class ProjectService {
+         });
+ 
+         // Ensure that all the open files have project
+         this.delayEnsureProjectForOpenFiles();
+     }
+ 
+     private removeProject(project: Project) {
+         this.logger.info("`remove Project::");
+         project.print(/*writeProjectFileNames*/ true, /*writeFileExplaination*/ true, /*writeFileVersionAndText*/ false);
+ 
+-        project.close();
++        // Unlink before close(): close() clears rootFilesMap/resolutionCache (isClosed)
++        // while the project can still be listed in inferredProjects until this returns.
++        // ensureProjectForOpenFiles / assignProjectToOpenedScriptInfo walk those lists
++        // synchronously during updateOpen; a listed-but-closed project faults in updateGraph.
++        this.pendingProjectUpdates.delete(project.getProjectName());
++
++        switch (project.projectKind) {
++            case ProjectKind.External:
++                unorderedRemoveItem(this.externalProjects, project as ExternalProject);
++                this.projectToSizeMap.delete(project.getProjectName());
++                break;
++            case ProjectKind.Configured:
++                this.configuredProjects.delete((project as ConfiguredProject).canonicalConfigFilePath);
++                this.projectToSizeMap.delete((project as ConfiguredProject).canonicalConfigFilePath);
++                break;
++            case ProjectKind.Inferred:
++                unorderedRemoveItem(this.inferredProjects, project as InferredProject);
++                break;
++        }
++
++        try {
++            project.close();
++        }
++        finally {
++            // If close() throws after unlinking, the project must not remain in any list.
++            this.pendingProjectUpdates.delete(project.getProjectName());
++            switch (project.projectKind) {
++                case ProjectKind.External:
++                    unorderedRemoveItem(this.externalProjects, project as ExternalProject);
++                    this.projectToSizeMap.delete(project.getProjectName());
++                    break;
++                case ProjectKind.Configured:
++                    this.configuredProjects.delete((project as ConfiguredProject).canonicalConfigFilePath);
++                    this.projectToSizeMap.delete((project as ConfiguredProject).canonicalConfigFilePath);
++                    break;
++                case ProjectKind.Inferred:
++                    unorderedRemoveItem(this.inferredProjects, project as InferredProject);
++                    break;
++            }
++        }
++
+         if (Debug.shouldAssert(AssertionLevel.Normal)) {
+             this.filenameToScriptInfo.forEach(info =>
+                 Debug.assert(
+                     !info.isAttached(project),
+                     "Found script Info still attached to project",
+                     () =>
+                         `${project.projectName}: ScriptInfos still attached: ${
+                             JSON.stringify(
+                                 arrayFrom(
+                                     mapDefinedIterator(
+@@ -2212,36 +2252,20 @@ export class ProjectService {
+                                                 } : undefined,
+                                     ),
+                                 ),
+                                 /*replacer*/ undefined,
+                                 " ",
+                             )
+                         }`,
+                 )
+             );
+         }
+-        // Remove the project from pending project updates
+-        this.pendingProjectUpdates.delete(project.getProjectName());
+-
+-        switch (project.projectKind) {
+-            case ProjectKind.External:
+-                unorderedRemoveItem(this.externalProjects, project as ExternalProject);
+-                this.projectToSizeMap.delete(project.getProjectName());
+-                break;
+-            case ProjectKind.Configured:
+-                this.configuredProjects.delete((project as ConfiguredProject).canonicalConfigFilePath);
+-                this.projectToSizeMap.delete((project as ConfiguredProject).canonicalConfigFilePath);
+-                break;
+-            case ProjectKind.Inferred:
+-                unorderedRemoveItem(this.inferredProjects, project as InferredProject);
+-                break;
+-        }
+     }
+ 
+     /** @internal */
+     assignOrphanScriptInfoToInferredProject(info: ScriptInfo, projectRootPath: NormalizedPath | undefined): InferredProject {
+         Debug.assert(info.isOrphan());
+         const project = this.getOrCreateInferredProjectForProjectRootPathIfEnabled(info, projectRootPath) ||
+             this.getOrCreateSingleInferredProjectIfEnabled() ||
+             this.getOrCreateSingleInferredWithoutProjectRoot(
+                 info.isDynamic ?
+                     projectRootPath || this.currentDirectory :
+diff --git i/src/server/project.ts w/src/server/project.ts
+index 88fa23c1bc..45031fdb7e 100644
+--- i/src/server/project.ts
++++ w/src/server/project.ts
+@@ -1122,22 +1122,30 @@ export abstract class Project implements LanguageServiceHost, ModuleResolutionHo
+     close(): void {
+         if (this.typingsCache) this.projectService.typingsInstaller.onProjectClosed(this);
+         this.typingsCache = undefined;
+         this.closeWatchingTypingLocations();
+         // if we have a program - release all files that are enlisted in program but arent root
+         // The releasing of the roots happens later
+         // The project could have pending update remaining and hence the info could be in the files but not in program graph
+         this.cleanupProgram();
+         // Release external files
+         forEach(this.externalFiles, externalFile => this.detachScriptInfoIfNotRoot(externalFile));
+-        // Always remove root files from the project
+-        this.rootFilesMap.forEach(root => root.info?.detachFromProject(this));
++        // Drop this project from every ScriptInfo.containingProjects. rootFilesMap
++        // alone misses files that were removed as roots during project reassignment
++        // (removeRoot clears the map entry without detachFromProject), leaving a
++        // closed project pointer that assignProjectToOpenedScriptInfo later walks
++        // via updateProjectIfDirty → updateGraph on a torn-down resolutionCache.
++        this.projectService.filenameToScriptInfo.forEach(info => {
++            if (info.isAttached(this)) {
++                info.detachFromProject(this);
++            }
++        });
+         this.projectService.pendingEnsureProjectForOpenFiles = true;
+ 
+         this.rootFilesMap = undefined!;
+         this.externalFiles = undefined;
+         this.program = undefined;
+         this.builderState = undefined;
+         this.resolutionCache.clear();
+         this.resolutionCache = undefined!;
+         this.cachedUnresolvedImportsPerFile = undefined!;
+         this.packageJsonWatches?.forEach(watcher => {
+@@ -1206,24 +1214,24 @@ export abstract class Project implements LanguageServiceHost, ModuleResolutionHo
+ 
+     getRootScriptInfos(): ScriptInfo[] {
+         return arrayFrom(ts.mapDefinedIterator(this.rootFilesMap.values(), value => value.info));
+     }
+ 
+     getScriptInfos(): ScriptInfo[] {
+         if (!this.languageServiceEnabled) {
+             // if language service is not enabled - return just root files
+             return this.getRootScriptInfos();
+         }
+-        return map(this.program!.getSourceFiles(), sourceFile => {
+-            const scriptInfo = this.projectService.getScriptInfoForPath(sourceFile.resolvedPath);
+-            Debug.assert(!!scriptInfo, "getScriptInfo", () => `scriptInfo for a file '${sourceFile.fileName}' Path: '${sourceFile.path}' / '${sourceFile.resolvedPath}' is missing.`);
+-            return scriptInfo;
++        return mapDefined(this.program!.getSourceFiles(), sourceFile => {
++            // tsgo-backed programs may list bundled/default-lib or generated
++            // companion files before tsserver has opened them as ScriptInfo.
++            return this.projectService.getScriptInfoForPath(sourceFile.resolvedPath);
+         });
+     }
+ 
+     getExcludedFiles(): readonly NormalizedPath[] {
+         return emptyArray;
+     }
+ 
+     getFileNames(excludeFilesFromExternalLibraries?: boolean, excludeConfigFiles?: boolean): NormalizedPath[] {
+         if (!this.program) {
+             return [];
+diff --git i/src/services/goToDefinition.ts w/src/services/goToDefinition.ts
+index 0a45cc3e3e..50309c2487 100644
+--- i/src/services/goToDefinition.ts
++++ w/src/services/goToDefinition.ts
+@@ -108,38 +108,40 @@ import {
+     SyntaxKind,
+     textRangeContainsPositionInclusive,
+     TextSpan,
+     tryCast,
+     tryGetModuleSpecifierFromDeclaration,
+     Type,
+     TypeChecker,
+     TypeFlags,
+     TypeReference,
+     unescapeLeadingUnderscores,
++    tnbDefinitionSpanForHostFileReference,
++    tnbHostExportDefinitionTextSpan,
+ } from "./_namespaces/ts.js";
+ 
+ /** @internal */
+ export function getDefinitionAtPosition(program: Program, sourceFile: SourceFile, position: number, searchOtherFilesOnly?: boolean, stopAtAlias?: boolean): readonly DefinitionInfo[] | undefined {
++    const typeChecker = program.getTypeChecker();
+     const resolvedRef = getReferenceAtPosition(sourceFile, position, program);
+-    const fileReferenceDefinition = resolvedRef && [getDefinitionInfoForFileReference(resolvedRef.reference.fileName, resolvedRef.fileName, resolvedRef.unverified)] || emptyArray;
++    const fileReferenceDefinition = resolvedRef && [getDefinitionInfoForFileReference(resolvedRef.reference.fileName, resolvedRef.fileName, resolvedRef.unverified, resolvedRef.file, typeChecker)] || emptyArray;
+     if (resolvedRef?.file) {
+         // If `file` is missing, do a symbol-based lookup as well
+         return fileReferenceDefinition;
+     }
+ 
+     const node = getTouchingPropertyName(sourceFile, position);
+     if (node === sourceFile) {
+         return undefined;
+     }
+ 
+     const { parent } = node;
+-    const typeChecker = program.getTypeChecker();
+ 
+     if (node.kind === SyntaxKind.OverrideKeyword || (isIdentifier(node) && isJSDocOverrideTag(parent) && parent.tagName === node)) {
+         const def = getDefinitionFromOverriddenMember(typeChecker, node);
+         if (def !== undefined || node.kind !== SyntaxKind.OverrideKeyword) {
+             return def || emptyArray;
+         }
+     }
+ 
+     // Labels
+     if (isJumpStatementTarget(node)) {
+@@ -198,27 +200,34 @@ export function getDefinitionAtPosition(program: Program, sourceFile: SourceFile
+             ({ symbol, failedAliasResolution } = getSymbol(moduleSpecifier, typeChecker, stopAtAlias));
+             fallbackNode = moduleSpecifier;
+         }
+     }
+ 
+     if (!symbol && isModuleSpecifierLike(fallbackNode)) {
+         // We couldn't resolve the module specifier as an external module, but it could
+         // be that module resolution succeeded but the target was not a module.
+         const ref = program.getResolvedModuleFromModuleSpecifier(fallbackNode, sourceFile)?.resolvedModule;
+         if (ref) {
++            const targetFile = program.getSourceFile(ref.resolvedFileName);
++            const getSpan = (typeChecker as any).getDefinitionSpanForDeclaration;
++            const hostSpan = targetFile && (
++                typeof getSpan === "function"
++                    ? getSpan(targetFile)
++                    : tnbDefinitionSpanForHostFileReference(targetFile)
++            );
+             return [{
+                 name: fallbackNode.text,
+                 fileName: ref.resolvedFileName,
+                 containerName: undefined!,
+                 containerKind: undefined!,
+                 kind: ScriptElementKind.scriptElement,
+-                textSpan: createTextSpan(0, 0),
++                textSpan: hostSpan ?? createTextSpan(0, 0),
+                 failedAliasResolution,
+                 isAmbient: isDeclarationFileName(ref.resolvedFileName),
+                 unverified: fallbackNode !== node,
+             }];
+         }
+     }
+ 
+     if (isModifier(node) && (isClassElement(parent) || isNamedDeclaration(parent))) {
+         symbol = parent.symbol;
+     }
+@@ -385,33 +394,48 @@ export function getReferenceAtPosition(sourceFile: SourceFile, position: number,
+ 
+     const libReferenceDirective = findReferenceInPosition(sourceFile.libReferenceDirectives, position);
+     if (libReferenceDirective) {
+         const file = program.getLibFileFromReference(libReferenceDirective);
+         return file && { reference: libReferenceDirective, fileName: file.fileName, file, unverified: false };
+     }
+ 
+     if (sourceFile.imports.length || sourceFile.moduleAugmentations.length) {
+         const node = getTouchingToken(sourceFile, position);
+         let resolution: ResolvedModuleWithFailedLookupLocations | undefined;
+-        if (isModuleSpecifierLike(node) && isExternalModuleNameRelative(node.text) && (resolution = program.getResolvedModuleFromModuleSpecifier(node, sourceFile))) {
++        if (isModuleSpecifierLike(node) && (resolution = program.getResolvedModuleFromModuleSpecifier(node, sourceFile))) {
+             const verifiedFileName = resolution.resolvedModule?.resolvedFileName;
+-            const fileName = verifiedFileName || resolvePath(getDirectoryPath(sourceFile.fileName), node.text);
+-            return {
+-                file: program.getSourceFile(fileName),
+-                fileName,
+-                reference: {
+-                    pos: node.getStart(),
+-                    end: node.getEnd(),
+-                    fileName: node.text,
+-                },
+-                unverified: !verifiedFileName,
+-            };
++            if (verifiedFileName) {
++                const file = program.getSourceFile(verifiedFileName);
++                return file && {
++                    file,
++                    fileName: verifiedFileName,
++                    reference: {
++                        pos: node.getStart(),
++                        end: node.getEnd(),
++                        fileName: node.text,
++                    },
++                    unverified: false,
++                };
++            }
++            if (isExternalModuleNameRelative(node.text)) {
++                const fileName = resolvePath(getDirectoryPath(sourceFile.fileName), node.text);
++                return {
++                    file: program.getSourceFile(fileName),
++                    fileName,
++                    reference: {
++                        pos: node.getStart(),
++                        end: node.getEnd(),
++                        fileName: node.text,
++                    },
++                    unverified: true,
++                };
++            }
+         }
+     }
+ 
+     return undefined;
+ }
+ 
+ const typesWithUnwrappedTypeArguments = new Set([
+     "Array",
+     "ArrayLike",
+     "ReadonlyArray",
+@@ -626,21 +650,45 @@ function isExpandoDeclaration(node: Declaration): boolean {
+ 
+ function getDefinitionFromSymbol(typeChecker: TypeChecker, symbol: Symbol, node: Node, failedAliasResolution?: boolean, declarationFilter?: (d: Declaration) => boolean): DefinitionInfo[] | undefined {
+     const filteredDeclarations = declarationFilter !== undefined ? filter(symbol.declarations, declarationFilter) : symbol.declarations;
+     // If we have a declaration filter, we are looking for specific declaration(s), so we should not return prematurely.
+     const signatureDefinition = !declarationFilter && (getConstructSignatureDefinition() || getCallSignatureDefinition());
+     if (signatureDefinition) {
+         return signatureDefinition;
+     }
+     const withoutExpandos = filter(filteredDeclarations, d => !isExpandoDeclaration(d));
+     const results = some(withoutExpandos) ? withoutExpandos : filteredDeclarations;
+-    return map(results, declaration => createDefinitionInfo(declaration, typeChecker, symbol, node, /*unverified*/ false, failedAliasResolution));
++    return map(results, declaration => {
++        const getHostSpan = (typeChecker as any).getDefinitionSpanForDeclaration;
++        const hostSpan = typeof getHostSpan === "function"
++            ? getHostSpan(declaration)
++            : tnbHostExportDefinitionTextSpan(declaration);
++        if (hostSpan) {
++            let symbolKind = ScriptElementKind.scriptElement;
++            try {
++                symbolKind = SymbolDisplay.getSymbolKind(typeChecker, symbol, node);
++            } catch {
++                // tsgo-backed symbols may lack exportSymbol metadata.
++            }
++            return createDefinitionInfoFromName(
++                typeChecker,
++                declaration,
++                symbolKind,
++                typeChecker.symbolToString(symbol),
++                symbol.parent ? typeChecker.symbolToString(symbol.parent, node) : "",
++                /*unverified*/ false,
++                failedAliasResolution,
++                hostSpan,
++            );
++        }
++        return createDefinitionInfo(declaration, typeChecker, symbol, node, /*unverified*/ false, failedAliasResolution);
++    });
+ 
+     function getConstructSignatureDefinition(): DefinitionInfo[] | undefined {
+         // Applicable only if we are in a new expression, or we are on a constructor declaration
+         // and in either case the symbol has a construct signature definition, i.e. class
+         if (symbol.flags & SymbolFlags.Class && !(symbol.flags & (SymbolFlags.Function | SymbolFlags.Variable)) && (isNewExpressionTarget(node) || node.kind === SyntaxKind.ConstructorKeyword)) {
+             const cls = find(filteredDeclarations, isClassLike);
+             return cls && getSignatureDefinition(cls.members, /*selectConstructors*/ true);
+         }
+     }
+ 
+@@ -754,24 +802,31 @@ function isDefinitionVisible(checker: TypeChecker, declaration: Declaration): bo
+ }
+ 
+ function createDefinitionFromSignatureDeclaration(typeChecker: TypeChecker, decl: SignatureDeclaration, failedAliasResolution?: boolean): DefinitionInfo {
+     return createDefinitionInfo(decl, typeChecker, decl.symbol, decl, /*unverified*/ false, failedAliasResolution);
+ }
+ 
+ function findReferenceInPosition(refs: readonly FileReference[], pos: number): FileReference | undefined {
+     return find(refs, ref => textRangeContainsPositionInclusive(ref, pos));
+ }
+ 
+-function getDefinitionInfoForFileReference(name: string, targetFileName: string, unverified: boolean): DefinitionInfo {
++function getDefinitionInfoForFileReference(name: string, targetFileName: string, unverified: boolean, targetFile?: SourceFile, typeChecker?: TypeChecker): DefinitionInfo {
++    let hostSpan: TextSpan | undefined;
++    if (targetFile) {
++        const getSpan = typeChecker && (typeChecker as any).getDefinitionSpanForDeclaration;
++        hostSpan = typeof getSpan === "function"
++            ? getSpan(targetFile)
++            : tnbDefinitionSpanForHostFileReference(targetFile);
++    }
+     return {
+         fileName: targetFileName,
+-        textSpan: createTextSpanFromBounds(0, 0),
++        textSpan: hostSpan ?? createTextSpanFromBounds(0, 0),
+         kind: ScriptElementKind.scriptElement,
+         name,
+         containerName: undefined!,
+         containerKind: undefined!, // TODO: GH#18217
+         unverified,
+     };
+ }
+ 
+ /** Returns a CallLikeExpression where `node` is the target being invoked. */
+ function getAncestorCallLikeExpression(node: Node): CallLikeExpression | undefined {
+diff --git i/src/services/services.ts w/src/services/services.ts
+index 9885093ed6..38185c95ea 100644
+--- i/src/services/services.ts
++++ w/src/services/services.ts
+@@ -323,20 +323,22 @@ import {
+     TextInsertion,
+     TextRange,
+     textRangeContainsTextSpan,
+     textRangeIntersectsWithTextSpan,
+     TextSpan,
+     textSpanContainsTextRange,
+     textSpanEnd,
+     timestamp,
+     TodoComment,
+     TodoCommentDescriptor,
++    tnbSetLanguageServiceHost,
++    tnbCollectOpenRootFileNames,
+     Token,
+     toPath,
+     tracing,
+     TransformFlags,
+     Type,
+     TypeChecker,
+     TypeFlags,
+     TypeNode,
+     TypeParameter,
+     TypePredicate,
+@@ -1716,30 +1718,34 @@ export function createLanguageService(
+         if (lastTypesRootVersion !== typeRootsVersion) {
+             log("TypeRoots version has changed; provide new program");
+             program = undefined!; // TODO: GH#18217
+             lastTypesRootVersion = typeRootsVersion;
+         }
+ 
+         // This array is retained by the program and will be used to determine if the program is up to date,
+         // so we need to make a copy in case the host mutates the underlying array - otherwise it would look
+         // like every program always has the host's current list of root files.
+         const rootFileNames = host.getScriptFileNames().slice();
++        for (const fn of tnbCollectOpenRootFileNames(host)) {
++            if (rootFileNames.indexOf(fn) < 0) rootFileNames.push(fn);
++        }
+ 
+         // Get a fresh cache of the host information
+         const newSettings = host.getCompilationSettings() || getDefaultCompilerOptions();
+         const hasInvalidatedResolutions: HasInvalidatedResolutions = host.hasInvalidatedResolutions || returnFalse;
+         const hasInvalidatedLibResolutions = maybeBind(host, host.hasInvalidatedLibResolutions) || returnFalse;
+         const hasChangedAutomaticTypeDirectiveNames = maybeBind(host, host.hasChangedAutomaticTypeDirectiveNames);
+         const projectReferences = host.getProjectReferences?.();
+         let parsedCommandLines: Map<Path, ParsedCommandLine | false> | undefined;
+ 
+         // Now create a new compiler
++        tnbSetLanguageServiceHost(host);
+         let compilerHost: CompilerHost | undefined = {
+             getSourceFile: getOrCreateSourceFile,
+             getSourceFileByPath: getOrCreateSourceFileByPath,
+             getCancellationToken: () => cancellationToken,
+             getCanonicalFileName,
+             useCaseSensitiveFileNames: () => useCaseSensitiveFileNames,
+             getNewLine: () => getNewLineCharacter(newSettings),
+             getDefaultLibFileName: options => host.getDefaultLibFileName(options),
+             writeFile: noop,
+             getCurrentDirectory: () => currentDirectory,
+@@ -2027,23 +2033,29 @@ export function createLanguageService(
+             const sourceFile = program.getSourceFile(docSpan.fileName);
+             if (!sourceFile) return undefined;
+             const rawNode = getTouchingPropertyName(sourceFile, docSpan.textSpan.start);
+             const adjustedNode = FindAllReferences.Core.getAdjustedNode(rawNode, { use: FindAllReferences.FindReferencesUse.References });
+             return adjustedNode;
+         }
+     }
+ 
+     function cleanupSemanticCache(): void {
+         if (program) {
+-            // Use paths to ensure we are using correct key and paths as document registry could be created with different current directory than host
+-            const key = documentRegistry.getKeyForCompilationSettings(program.getCompilerOptions());
+-            forEach(program.getSourceFiles(), f => documentRegistry.releaseDocumentWithKey(f.resolvedPath, key, f.scriptKind, f.impliedNodeFormat));
++            // tsgo-backed programs (the fork's default) never acquire their source
++            // files through the document registry, so there is nothing to release.
++            // Running the release pass would fault on the absent registry bucket and
++            // abort ConfiguredProject.close mid-teardown, leaking a half-closed project.
++            if (!(program as any).isTsgoBackedProgram) {
++                // Use paths to ensure we are using correct key and paths as document registry could be created with different current directory than host
++                const key = documentRegistry.getKeyForCompilationSettings(program.getCompilerOptions());
++                forEach(program.getSourceFiles(), f => documentRegistry.releaseDocumentWithKey(f.resolvedPath, key, f.scriptKind, f.impliedNodeFormat));
++            }
+             program = undefined!; // TODO: GH#18217
+         }
+     }
+ 
+     function dispose(): void {
+         cleanupSemanticCache();
+         host = undefined!;
+     }
+ 
+     /// Diagnostics
